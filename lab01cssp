@@ -1,0 +1,329 @@
+# Lab: Preventing SQL Injection with Prepared Statements
+
+**Cybersecurity & Secure Programming**
+
+---
+
+## Abstract
+
+This lab outlines the nature of **SQL Injection (SQLi)** vulnerabilities, a critical threat to web applications. It provides a comprehensive guide to understanding, identifying, and preventing these attacks using **prepared statements**. The primary focus is on practical implementation within a **PHP and XAMPP** environment.
+
+---
+
+## 1. Introduction
+
+### 1.1 Learning Objectives
+
+Upon completion of this lab, you will be able to:
+
+- ✅ Define SQL Injection and explain the mechanism of the attack.
+- ✅ Exploit a vulnerable script to understand the impact of SQLi.
+- ✅ Remediate vulnerable scripts by implementing prepared statements for `SELECT` and `UPDATE` queries.
+- ✅ Write new, secure PHP scripts for database `INSERT` operations from scratch.
+- ✅ Implement advanced security techniques like whitelisting for dynamic queries.
+
+### 1.2 Prerequisites
+
+- A working **XAMPP installation** (with Apache and MySQL running).
+- The `secure_lab_db` database has been imported into your phpMyAdmin environment.
+- Basic understanding of SQL queries and PHP syntax.
+- A text editor (e.g., VS Code, Sublime Text).
+
+---
+
+## 2. Lab Setup: Understanding the Database
+
+For these exercises, you will use a pre-populated database named `secure_lab_db`.
+
+### 2.1 Database Schema
+
+The database consists of four related tables: `users`, `products`, `posts`, and `comments`.
+
+- **users**  
+  - `id` (INT, Primary Key)  
+  - `username` (VARCHAR)  
+  - `password_hash` (VARCHAR)  
+  - `bio` (TEXT)  
+
+- **products**  
+  - `id` (INT, Primary Key)  
+  - `name` (VARCHAR)  
+  - `price` (DECIMAL)  
+  - `category` (VARCHAR)  
+
+- **posts**  
+  - `id` (INT, Primary Key)  
+  - `user_id` (INT, FK → users.id)  
+  - `title` (VARCHAR)  
+  - `content` (TEXT)  
+
+- **comments**  
+  - `id` (INT, Primary Key)  
+  - `post_id` (INT, FK → posts.id)  
+  - `user_id` (INT, FK → users.id)  
+  - `comment_text` (TEXT)  
+
+> **Pro Tip**: Use these connection details in XAMPP:
+> - Database: `secure_lab_db`  
+> - Username: `root`  
+> - Password: *(empty)*  
+> - Host: `127.0.0.1`
+
+---
+
+## 3. The Threat of SQL Injection
+
+An SQLi vulnerability allows an attacker to alter the logic of SQL queries, potentially leading to **unauthorised data access, modification, or destruction**.
+
+### 3.1 Anatomy of an Attack
+
+Consider the following vulnerable login script (`vulnerable_login.php`):
+
+```php
+<?php
+// DANGER: This code is highly vulnerable.
+$host = '127.0.0.1'; $db = 'secure_lab_db'; $user = 'root'; $pass = '';
+$mysqli = new mysqli($host, $user, $pass, $db);
+if ($mysqli->connect_error) { die("Connection failed: " . $mysqli->connect_error); }
+
+$username = $_POST['username'] ?? '';
+$password = $_POST['password'] ?? '';
+
+if (!empty($username)) {
+    // VULNERABLE QUERY
+    $query = "SELECT * FROM users WHERE username = '" . $username . "'";
+    $result = $mysqli->query($query);
+
+    if ($result && $result->num_rows > 0) {
+        echo "<h1>Login Successful (Vulnerable)</h1>";
+        echo "Welcome, " . htmlspecialchars($result->fetch_assoc()['username']);
+    } else {
+        echo "<h1>Login Failed</h1>";
+    }
+}
+?>
+<form method="POST" action="">
+    Username: <input type="text" name="username"><br>
+    Password: <input type="password" name="password"><br>
+    <input type="submit" value="Login">
+</form>
+```
+
+> **Lab Task 3.1 — Exploit and Fix**
+>
+> **Part A — Exploit**
+> 1. Save as `vulnerable_login.php` in your `htdocs` directory.  
+> 2. Visit `http://localhost/vulnerable_login.php`.  
+> 3. Enter username: `' OR '1'='1' --` and submit.  
+> 4. Observe that login succeeds without valid credentials.
+>
+> **Part B — Fix**
+> - Replace `mysqli` usage with `PDO`.
+> - Use `prepare()` and `execute()` to bind parameters.  
+> - Re-run the attack to confirm it fails.
+
+---
+
+## 4. The Solution: Prepared Statements
+
+The fundamental defence against SQL injection is separating SQL code from user data using **prepared statements**. The server compiles the SQL structure first; user-supplied values are provided later and bound as data only.
+
+> **Key Concept**: A prepared statement strictly separates SQL logic from user-provided data. The database compiles the SQL structure first, then parameters are bound as literal values. This prevents user input from being interpreted as executable SQL.
+
+### 4.1 Secure Login Example (PDO)
+
+```php
+// Secure login implementation (PDO)
+$username = $_POST['username'] ?? '';
+$password = $_POST['password'] ?? '';
+
+$query = "SELECT * FROM users WHERE username = ? AND password = ?";
+$stmt  = $pdo->prepare($query);
+$stmt->execute([$username, $password]);
+
+if ($stmt->fetch()) {
+    // User logged in successfully
+}
+```
+
+---
+
+## 5. Practical Implementation in XAMPP
+
+### 5.1 Secure Product Search Script (`search.php`)
+
+```php
+<?php
+// 1. Database connection
+$host = '127.0.0.1';
+$db   = 'secure_lab_db';
+$user = 'root';
+$pass = '';
+$charset = 'utf8mb4';
+
+$dsn = "mysql:host=$host;dbname=$db;charset=$charset";
+$options = [
+    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    PDO::ATTR_EMULATE_PREPARES   => false,
+];
+
+try {
+    $pdo = new PDO($dsn, $user, $pass, $options);
+} catch (\PDOException $e) {
+    throw new \PDOException($e->getMessage(), (int)$e->getCode());
+}
+
+// 2. Get user input
+$keyword = $_GET['search'] ?? 'Laptop';
+
+// 3. Prepare & execute
+$sql = "SELECT * FROM products WHERE name LIKE :keyword";
+$stmt = $pdo->prepare($sql);
+$stmt->execute(['keyword' => '%' . $keyword . '%']);
+
+// 4. Fetch & display
+$products = $stmt->fetchAll();
+foreach ($products as $product) {
+    echo htmlspecialchars($product['name']) . "<br>";
+}
+?>
+```
+
+**Lab Task 5.1 — Create a Secure Registration System**
+
+**Part A — HTML Form (`register.html`)**
+
+```html
+<form action="register.php" method="POST">
+    <h3>Register New User</h3>
+    <label>Username: <input type="text" name="username" required></label><br>
+    <label>Password: <input type="password" name="password" required></label><br>
+    <input type="submit" value="Register">
+</form>
+```
+
+**Part B — Secure PHP Handler (`register.php`)**
+
+Your `register.php` must:
+1. Connect to `secure_lab_db` using PDO.  
+2. Safely retrieve `username` and `password` from `$_POST`.  
+3. Hash the password with `password_hash()`.  
+4. Use a prepared `INSERT` statement to add the user.  
+5. Print a success or failure message.
+
+### 5.2 Fixing Vulnerable UPDATE Statements
+
+Consider this vulnerable profile update script (`vulnerable_profile.php`):
+
+```php
+<?php
+$host = '127.0.0.1'; $db = 'secure_lab_db'; $user = 'root'; $pass = '';
+$pdo = new PDO("mysql:host=$host;dbname=$db;charset=utf8mb4", $user, $pass);
+
+// In a real app, user_id would come from a session, but here it is in a hidden form field
+$user_id = $_POST['user_id'] ?? 1; // Default to admin for demo
+$bio = $_POST['bio'] ?? '';
+
+if (!empty($bio)) {
+    // DANGEROUS: Both bio and user_id are from user input and concatenated!
+    $sql = "UPDATE users SET bio = '{$bio}' WHERE id = {$user_id}";
+    $pdo->query($sql);
+    echo "Profile updated for user ID: {$user_id}!";
+}
+?>
+<form method="POST" action="">
+    <h3>Update Bio for User ID: <?php echo htmlspecialchars($user_id); ?></h3>
+    <input type="hidden" name="user_id" value="<?php echo htmlspecialchars($user_id); ?>">
+    <textarea name="bio" rows="4" cols="50"></textarea><br>
+    <input type="submit" value="Update Bio">
+</form>
+```
+
+> **Task 5.2 — Securing an UPDATE Query**  
+> Rewrite `vulnerable_profile.php` to use a PDO prepared statement that parameterises both `bio` and `user_id`.
+
+---
+
+## 6. Advanced Challenge Exercises
+
+### 6.1 Object-Oriented Secure Code
+
+**Task 6.1 — Extend the SecureBlog Class**
+
+- Save the base code as `blog.php` in `htdocs`.
+- Add a method:
+  ```php
+  public function add_comment(int $post_id, int $user_id, string $comment_text): bool
+  ```
+- Implement a secure prepared `INSERT` into `comments` and return `true` on success.
+- Add test code calling `add_comment(1, 2, 'Nice post!')`.
+
+**Base code (`blog.php`)**
+
+```php
+<?php
+class SecureBlog {
+    private PDO $pdo;
+    public function __construct(array $db_config) {
+        $dsn = "mysql:host={$db_config['host']};dbname={$db_config['db']};charset={$db_config['charset']}";
+        $options = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC, PDO::ATTR_EMULATE_PREPARES => false];
+        $this->pdo = new PDO($dsn, $db_config['user'], $db_config['pass'], $options);
+    }
+    // Your new add_comment() method goes here!
+}
+
+// Example Usage
+$config = ['host' => '127.0.0.1', 'db' => 'secure_lab_db', 'user' => 'root', 'pass' => '', 'charset' => 'utf8mb4'];
+$blog = new SecureBlog($config);
+?>
+```
+
+### 6.2 Challenge — Dynamic Sorting (Whitelisting)
+
+This is more advanced because structural SQL parts (like column names or `ORDER BY`) cannot be parameterised. Use **whitelisting**.
+
+**Task 6.2 — Implement Secure Dynamic Sorting**
+
+1. Accept optional GET parameters: `sort_by` (e.g., `name`, `price`) and `sort_order` (`ASC`/`DESC`).  
+2. Create two whitelists in PHP: allowed columns (`['name','price','category']`) and allowed orders (`['ASC','DESC']`).  
+3. Validate parameters against whitelists; fallback to safe defaults (`name`, `ASC`).  
+4. Build `ORDER BY` using validated values only. The `WHERE` clause must still use prepared statements.
+
+---
+
+## 7. Conclusion
+
+Mastering prepared statements is a fundamental requirement for any developer building database-driven applications. By consistently separating **code from data** and using techniques such as **whitelisting** for structural query parts, you can effectively eliminate SQL injection risks and build secure, maintainable applications.
+
+---
+
+## Appendix: Useful Snippets
+
+**Password hashing (PHP)**
+
+```php
+$hash = password_hash($password, PASSWORD_ARGON2ID);
+if (password_verify($password, $hash)) {
+    // valid
+}
+```
+
+**Example PDO prepared SELECT**
+
+```php
+$stmt = $pdo->prepare('SELECT id, username FROM users WHERE username = ?');
+$stmt->execute([$username]);
+$user = $stmt->fetch();
+```
+
+**Example PDO prepared INSERT**
+
+```php
+$stmt = $pdo->prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)');
+$stmt->execute([$username, $password_hash]);
+```
+
+---
+
+**End of lab**
