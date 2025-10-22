@@ -1,329 +1,303 @@
-# Lab: Preventing SQL Injection with Prepared Statements
+# Step 4 – Login Sessions Deep Dive
 
-**Cybersecurity & Secure Programming**
+This document walks through the reference implementation in `expected_states/step04_login_sessions`. It explains how every file contributes to authenticating users, storing their credentials, and protecting routes with Flask-Login. Diagrams show how the moving pieces collaborate.
 
----
+## Directory Layout
 
-## Abstract
+```mermaid
+flowchart TD
+    A[Flask App] --> B["__init__.py / App factory"]
+    A --> C["auth.py / Auth blueprint"]
+    A --> D["views.py / Notes blueprint"]
+    A --> E["models.py / SQLAlchemy models"]
+    A --> F[templates/]
+    A --> G[static/styles.css]
+```
 
-This lab outlines the nature of **SQL Injection (SQLi)** vulnerabilities, a critical threat to web applications. It provides a comprehensive guide to understanding, identifying, and preventing these attacks using **prepared statements**. The primary focus is on practical implementation within a **PHP and XAMPP** environment.
+All application code for this step lives under `expected_states/step04_login_sessions/app/`. You can drop this folder into a `FLASK_APP` project to run the Step 4 snapshot.
 
----
+## Configuration & App Factory (`app/__init__.py`)
 
-## 1. Introduction
+```python
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+login_manager = LoginManager()
+```
+- Loads environment variables from `.env` at the repo root. This lets you store secrets such as the MySQL password outside source control.
+- Creates a module-level `LoginManager` so every app instance shares the same configuration.
 
-### 1.1 Learning Objectives
+```python
+def create_app(test_config: dict | None = None) -> Flask:
+    app = Flask(__name__, instance_relative_config=False)
+    app.config.update(
+        SECRET_KEY=os.getenv("SECRET_KEY", "dev-secret-change-me"),
+        SQLALCHEMY_DATABASE_URI=_build_database_uri(),
+        SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+    )
+```
+- `create_app` is the Flask application factory. It sets security-focused defaults:
+  - `SECRET_KEY` signs cookies and CSRF tokens.
+  - `SESSION_COOKIE_*` flags harden the cookie (HTTPS only, HTTP-only, same-site).
+  - `SQLALCHEMY_DATABASE_URI` comes from `_build_database_uri` (see below).
 
-Upon completion of this lab, you will be able to:
+```python
+    if test_config:
+        app.config.update(test_config)
+```
+- Allows unit tests to override settings (e.g., swapping in SQLite).
 
-- ✅ Define SQL Injection and explain the mechanism of the attack.
-- ✅ Exploit a vulnerable script to understand the impact of SQLi.
-- ✅ Remediate vulnerable scripts by implementing prepared statements for `SELECT` and `UPDATE` queries.
-- ✅ Write new, secure PHP scripts for database `INSERT` operations from scratch.
-- ✅ Implement advanced security techniques like whitelisting for dynamic queries.
+```python
+    db.init_app(app)
+    login_manager.init_app(app)
+    login_manager.login_view = "auth.login"
+    login_manager.session_protection = "strong"
+```
+- Attaches the global SQLAlchemy object to the app so it can open DB sessions.
+- Hooks Flask-Login into the app:
+  - `login_view` tells Flask-Login where to redirect anonymous users.
+  - `"strong"` session protection revalidates the session if the user’s IP/user agent changes.
 
-### 1.2 Prerequisites
+```python
+    @login_manager.user_loader
+    def load_user(user_id: str) -> User | None:
+        if not user_id:
+            return None
+        return User.query.get(int(user_id))
+```
+- Flask-Login calls this whenever it needs to rehydrate the current user from the session cookie. It looks up the `User` row by primary key.
 
-- A working **XAMPP installation** (with Apache and MySQL running).
-- The `secure_lab_db` database has been imported into your phpMyAdmin environment.
-- Basic understanding of SQL queries and PHP syntax.
-- A text editor (e.g., VS Code, Sublime Text).
+```python
+    from .auth import auth_bp
+    from .views import views_bp
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(views_bp)
+```
+- Imports blueprints lazily (after app creation to avoid circular dependencies) and registers them.
 
----
+```python
+    with app.app_context():
+        db.create_all()
+```
+- Ensures the database tables exist before serving requests. In production you’d run migrations instead; for the lab it auto-creates the schema.
 
-## 2. Lab Setup: Understanding the Database
+```python
+def _build_database_uri() -> str:
+    host = os.getenv("DB_HOST", "127.0.0.1")
+    ...
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{name}?charset=utf8mb4"
+```
+- Creates a SQLAlchemy-compatible MySQL URI from environment variables, defaulting to sensible dev values.
 
-For these exercises, you will use a pre-populated database named `secure_lab_db`.
+## Data Model (`app/models.py`)
 
-### 2.1 Database Schema
+```python
+db = SQLAlchemy()
+```
+- A single SQLAlchemy instance shared by all modules. It provides the ORM and connection pooling.
 
-The database consists of four related tables: `users`, `products`, `posts`, and `comments`.
+```python
+class User(UserMixin, db.Model):
+    __tablename__ = "users"
 
-- **users**  
-  - `id` (INT, Primary Key)  
-  - `username` (VARCHAR)  
-  - `password_hash` (VARCHAR)  
-  - `bio` (TEXT)  
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+```
+- Represents accounts in the `users` table.
+- `UserMixin` supplies Flask-Login defaults (`is_authenticated`, `is_active`, etc.).
+- Stores hashed passwords only (no plaintext!), along with a created timestamp.
 
-- **products**  
-  - `id` (INT, Primary Key)  
-  - `name` (VARCHAR)  
-  - `price` (DECIMAL)  
-  - `category` (VARCHAR)  
+```python
+    def get_id(self) -> str:
+        return str(self.id)
+```
+- Ensures Flask-Login always receives string identifiers to embed in the session cookie.
 
-- **posts**  
-  - `id` (INT, Primary Key)  
-  - `user_id` (INT, FK → users.id)  
-  - `title` (VARCHAR)  
-  - `content` (TEXT)  
+### Database Snapshot
 
-- **comments**  
-  - `id` (INT, Primary Key)  
-  - `post_id` (INT, FK → posts.id)  
-  - `user_id` (INT, FK → users.id)  
-  - `comment_text` (TEXT)  
-
-> **Pro Tip**: Use these connection details in XAMPP:
-> - Database: `secure_lab_db`  
-> - Username: `root`  
-> - Password: *(empty)*  
-> - Host: `127.0.0.1`
-
----
-
-## 3. The Threat of SQL Injection
-
-An SQLi vulnerability allows an attacker to alter the logic of SQL queries, potentially leading to **unauthorised data access, modification, or destruction**.
-
-### 3.1 Anatomy of an Attack
-
-Consider the following vulnerable login script (`vulnerable_login.php`):
-
-```php
-<?php
-// DANGER: This code is highly vulnerable.
-$host = '127.0.0.1'; $db = 'secure_lab_db'; $user = 'root'; $pass = '';
-$mysqli = new mysqli($host, $user, $pass, $db);
-if ($mysqli->connect_error) { die("Connection failed: " . $mysqli->connect_error); }
-
-$username = $_POST['username'] ?? '';
-$password = $_POST['password'] ?? '';
-
-if (!empty($username)) {
-    // VULNERABLE QUERY
-    $query = "SELECT * FROM users WHERE username = '" . $username . "'";
-    $result = $mysqli->query($query);
-
-    if ($result && $result->num_rows > 0) {
-        echo "<h1>Login Successful (Vulnerable)</h1>";
-        echo "Welcome, " . htmlspecialchars($result->fetch_assoc()['username']);
-    } else {
-        echo "<h1>Login Failed</h1>";
+```mermaid
+erDiagram
+    USERS {
+        int id PK
+        varchar email UK
+        varchar password_hash
+        datetime created_at
     }
-}
-?>
-<form method="POST" action="">
-    Username: <input type="text" name="username"><br>
-    Password: <input type="password" name="password"><br>
-    <input type="submit" value="Login">
-</form>
 ```
 
-> **Lab Task 3.1 — Exploit and Fix**
->
-> **Part A — Exploit**
-> 1. Save as `vulnerable_login.php` in your `htdocs` directory.  
-> 2. Visit `http://localhost/vulnerable_login.php`.  
-> 3. Enter username: `' OR '1'='1' --` and submit.  
-> 4. Observe that login succeeds without valid credentials.
->
-> **Part B — Fix**
-> - Replace `mysqli` usage with `PDO`.
-> - Use `prepare()` and `execute()` to bind parameters.  
-> - Re-run the attack to confirm it fails.
+- Authentication only needs a single table at this stage. Notes and other entities arrive in later steps.
 
----
+## Authentication Blueprint (`app/auth.py`)
 
-## 4. The Solution: Prepared Statements
+```python
+auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
+```
+- Names the blueprint `auth`. All routes hang off `/auth`.
 
-The fundamental defence against SQL injection is separating SQL code from user data using **prepared statements**. The server compiles the SQL structure first; user-supplied values are provided later and bound as data only.
+### Registration Route
 
-> **Key Concept**: A prepared statement strictly separates SQL logic from user-provided data. The database compiles the SQL structure first, then parameters are bound as literal values. This prevents user input from being interpreted as executable SQL.
+```python
+@auth_bp.route("/register", methods=("GET", "POST"))
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for("views.notes"))
+```
+- Blocks already-signed-in users from re-registering; sends them to the notes page.
 
-### 4.1 Secure Login Example (PDO)
+```python
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+```
+- On POST, normalizes the email so logins are case-insensitive.
 
-```php
-// Secure login implementation (PDO)
-$username = $_POST['username'] ?? '';
-$password = $_POST['password'] ?? '';
+```python
+        if not email or not password:
+            flash("Email and password are required.", "error")
+            return render_template("register.html")
+```
+- Validates required fields and uses `flash` to queue a message for the next render.
 
-$query = "SELECT * FROM users WHERE username = ? AND password = ?";
-$stmt  = $pdo->prepare($query);
-$stmt->execute([$username, $password]);
+```python
+        if User.query.filter_by(email=email).first():
+            flash("An account with that email already exists.", "error")
+            return render_template("register.html")
+```
+- Enforces unique emails via an application-level check (in addition to DB constraint).
 
-if ($stmt->fetch()) {
-    // User logged in successfully
-}
+```python
+        user = User(email=email, password_hash=generate_password_hash(password))
+        db.session.add(user)
+        db.session.commit()
+```
+- Generates a salted hash using Werkzeug’s `generate_password_hash`, then persists the new user.
+
+```python
+        flash("Account created. Please sign in.", "success")
+        return redirect(url_for("auth.login"))
+```
+- Confirms success and sends the user to the login form.
+
+### Login Route
+
+```python
+@auth_bp.route("/login", methods=("GET", "POST"))
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("views.notes"))
+```
+- Prevents authenticated users from hitting the login screen.
+
+```python
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        user = User.query.filter_by(email=email).one_or_none()
+        if not user or not check_password_hash(user.password_hash, password):
+            flash("Invalid email or password.", "error")
+            return render_template("login.html")
+```
+- Looks up the user by normalized email and verifies the supplied password against the stored hash.
+- Fails closed: the same message is shown for unknown emails and bad passwords.
+
+```python
+        login_user(user)
+        flash("Welcome back!", "success")
+        return redirect(url_for("views.notes"))
+```
+- `login_user` writes the user ID into the session cookie, marking the client as authenticated.
+
+### Logout Route
+
+```python
+@auth_bp.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    flash("Signed out successfully.", "success")
+    return redirect(url_for("auth.login"))
+```
+- `@login_required` ensures only logged-in users can log out, keeping the route simple.
+- `logout_user` clears the session and rotation tokens; user lands back on the login form.
+
+## Protected Views (`app/views.py`)
+
+```python
+views_bp = Blueprint("views", __name__)
+
+@views_bp.route("/")
+@login_required
+def notes():
+    return render_template("notes.html")
+```
+- The root url `/` hosts the notes page.
+- `@login_required` delegates to Flask-Login; anonymous visitors are redirected to `auth.login`.
+- When called, it renders `templates/notes.html`.
+
+## Templates (`app/templates/`)
+
+- `base.html`: Shared layout with page title, header, nav menu, and a content block.
+  - Navigation toggles links depending on `current_user.is_authenticated`.
+- `login.html`: Extends `base.html`, renders the login form, and links to registration.
+- `register.html`: Collects email and password for new accounts.
+- `notes.html`: Placeholder content confirming the user is signed in.
+
+Flashed messages are not yet rendered; you could add them later by looping over `get_flashed_messages` in `base.html`.
+
+## Styling (`app/static/styles.css`)
+
+- Defines a simple, consistent look for forms and layout.
+- Uses neutral colors and responsive-friendly spacing—enough to make the lab approachable without relying on Bootstrap.
+
+## Request Flow Diagrams
+
+### Successful Login
+
+```mermaid
+sequenceDiagram
+    participant U as User Browser
+    participant A as Flask (auth.login)
+    participant DB as MySQL
+    U->>A: POST /auth/login (email, password)
+    A->>DB: SELECT users WHERE email=?
+    DB-->>A: user row
+    A->>A: check_password_hash()
+    A->>U: Set session cookie<br/>Redirect / (notes)
+    U->>A: GET /
+    A-->>U: Render notes.html
 ```
 
----
+### Session Protection
 
-## 5. Practical Implementation in XAMPP
-
-### 5.1 Secure Product Search Script (`search.php`)
-
-```php
-<?php
-// 1. Database connection
-$host = '127.0.0.1';
-$db   = 'secure_lab_db';
-$user = 'root';
-$pass = '';
-$charset = 'utf8mb4';
-
-$dsn = "mysql:host=$host;dbname=$db;charset=$charset";
-$options = [
-    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    PDO::ATTR_EMULATE_PREPARES   => false,
-];
-
-try {
-    $pdo = new PDO($dsn, $user, $pass, $options);
-} catch (\PDOException $e) {
-    throw new \PDOException($e->getMessage(), (int)$e->getCode());
-}
-
-// 2. Get user input
-$keyword = $_GET['search'] ?? 'Laptop';
-
-// 3. Prepare & execute
-$sql = "SELECT * FROM products WHERE name LIKE :keyword";
-$stmt = $pdo->prepare($sql);
-$stmt->execute(['keyword' => '%' . $keyword . '%']);
-
-// 4. Fetch & display
-$products = $stmt->fetchAll();
-foreach ($products as $product) {
-    echo htmlspecialchars($product['name']) . "<br>";
-}
-?>
+```mermaid
+stateDiagram-v2
+    [*] --> Anonymous
+    Anonymous --> Authenticated : login_user(user)
+    Authenticated --> Anonymous : logout_user() or session invalid
 ```
 
-**Lab Task 5.1 — Create a Secure Registration System**
+- Flask-Login stores the user ID in the signed session cookie.
+- On each request, Flask reconstructs `current_user` by calling `load_user`.
+- If the session fails validation (expired, tampered, or fails the “strong” checks), Flask-Login reverts to `Anonymous`.
 
-**Part A — HTML Form (`register.html`)**
+## Putting It Together
 
-```html
-<form action="register.php" method="POST">
-    <h3>Register New User</h3>
-    <label>Username: <input type="text" name="username" required></label><br>
-    <label>Password: <input type="password" name="password" required></label><br>
-    <input type="submit" value="Register">
-</form>
+At Step 4, Secure Notes now:
+- Persists users in MySQL via SQLAlchemy.
+- Hashes passwords with Werkzeug and never stores plaintext.
+- Uses Flask-Login to manage sessions, enforce authentication, and redirect anonymous users to `/auth/login`.
+- Protects the main notes page with `@login_required`.
+- Provides registration and login forms styled with the shared base template.
+
+You can run this snapshot with the usual Flask workflow:
+
+```bash
+export FLASK_APP=app
+flask --app app --debug run
 ```
 
-**Part B — Secure PHP Handler (`register.php`)**
-
-Your `register.php` must:
-1. Connect to `secure_lab_db` using PDO.  
-2. Safely retrieve `username` and `password` from `$_POST`.  
-3. Hash the password with `password_hash()`.  
-4. Use a prepared `INSERT` statement to add the user.  
-5. Print a success or failure message.
-
-### 5.2 Fixing Vulnerable UPDATE Statements
-
-Consider this vulnerable profile update script (`vulnerable_profile.php`):
-
-```php
-<?php
-$host = '127.0.0.1'; $db = 'secure_lab_db'; $user = 'root'; $pass = '';
-$pdo = new PDO("mysql:host=$host;dbname=$db;charset=utf8mb4", $user, $pass);
-
-// In a real app, user_id would come from a session, but here it is in a hidden form field
-$user_id = $_POST['user_id'] ?? 1; // Default to admin for demo
-$bio = $_POST['bio'] ?? '';
-
-if (!empty($bio)) {
-    // DANGEROUS: Both bio and user_id are from user input and concatenated!
-    $sql = "UPDATE users SET bio = '{$bio}' WHERE id = {$user_id}";
-    $pdo->query($sql);
-    echo "Profile updated for user ID: {$user_id}!";
-}
-?>
-<form method="POST" action="">
-    <h3>Update Bio for User ID: <?php echo htmlspecialchars($user_id); ?></h3>
-    <input type="hidden" name="user_id" value="<?php echo htmlspecialchars($user_id); ?>">
-    <textarea name="bio" rows="4" cols="50"></textarea><br>
-    <input type="submit" value="Update Bio">
-</form>
-```
-
-> **Task 5.2 — Securing an UPDATE Query**  
-> Rewrite `vulnerable_profile.php` to use a PDO prepared statement that parameterises both `bio` and `user_id`.
-
----
-
-## 6. Advanced Challenge Exercises
-
-### 6.1 Object-Oriented Secure Code
-
-**Task 6.1 — Extend the SecureBlog Class**
-
-- Save the base code as `blog.php` in `htdocs`.
-- Add a method:
-  ```php
-  public function add_comment(int $post_id, int $user_id, string $comment_text): bool
-  ```
-- Implement a secure prepared `INSERT` into `comments` and return `true` on success.
-- Add test code calling `add_comment(1, 2, 'Nice post!')`.
-
-**Base code (`blog.php`)**
-
-```php
-<?php
-class SecureBlog {
-    private PDO $pdo;
-    public function __construct(array $db_config) {
-        $dsn = "mysql:host={$db_config['host']};dbname={$db_config['db']};charset={$db_config['charset']}";
-        $options = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC, PDO::ATTR_EMULATE_PREPARES => false];
-        $this->pdo = new PDO($dsn, $db_config['user'], $db_config['pass'], $options);
-    }
-    // Your new add_comment() method goes here!
-}
-
-// Example Usage
-$config = ['host' => '127.0.0.1', 'db' => 'secure_lab_db', 'user' => 'root', 'pass' => '', 'charset' => 'utf8mb4'];
-$blog = new SecureBlog($config);
-?>
-```
-
-### 6.2 Challenge — Dynamic Sorting (Whitelisting)
-
-This is more advanced because structural SQL parts (like column names or `ORDER BY`) cannot be parameterised. Use **whitelisting**.
-
-**Task 6.2 — Implement Secure Dynamic Sorting**
-
-1. Accept optional GET parameters: `sort_by` (e.g., `name`, `price`) and `sort_order` (`ASC`/`DESC`).  
-2. Create two whitelists in PHP: allowed columns (`['name','price','category']`) and allowed orders (`['ASC','DESC']`).  
-3. Validate parameters against whitelists; fallback to safe defaults (`name`, `ASC`).  
-4. Build `ORDER BY` using validated values only. The `WHERE` clause must still use prepared statements.
-
----
-
-## 7. Conclusion
-
-Mastering prepared statements is a fundamental requirement for any developer building database-driven applications. By consistently separating **code from data** and using techniques such as **whitelisting** for structural query parts, you can effectively eliminate SQL injection risks and build secure, maintainable applications.
-
----
-
-## Appendix: Useful Snippets
-
-**Password hashing (PHP)**
-
-```php
-$hash = password_hash($password, PASSWORD_ARGON2ID);
-if (password_verify($password, $hash)) {
-    // valid
-}
-```
-
-**Example PDO prepared SELECT**
-
-```php
-$stmt = $pdo->prepare('SELECT id, username FROM users WHERE username = ?');
-$stmt->execute([$username]);
-$user = $stmt->fetch();
-```
-
-**Example PDO prepared INSERT**
-
-```php
-$stmt = $pdo->prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)');
-$stmt->execute([$username, $password_hash]);
-```
-
----
-
-**End of lab**
+Be sure to provision the database (`mysql -u lab_user -p secure_notes_lab < sql/schema.sql`) and set matching credentials in `.env` before starting the server.
